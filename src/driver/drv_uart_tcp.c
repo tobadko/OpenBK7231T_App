@@ -41,6 +41,8 @@ static int g_bk_synced = 0;    // 0 = ловим бутлоадер, 1 = чип 
 static uint32_t g_bk_last_reset = 0; // Время последнего сброса (мс)
 static int g_magic_match = 0; // Для скользящего окна преамбулы (0x01, 0xE0, 0xFC)
 static int g_ack_match = 0;
+static int g_last_pulse_ms = 0;
+static int g_last_wait_ms = 0;
 static int g_reset_attempt = 0; // counter for dynamic sweeping CEN timing   // Для скользящего окна ответа (0x04, 0x0E)
 
 void Start_UART_TCP(void* arg);
@@ -87,7 +89,7 @@ static void UTCP_TX_Thd(void* param)
 					{
 						g_ack_match = 0;
 						g_bk_synced = 1;
-						ADDLOG_INFO(LOG_FEATURE_DRV, "CB2S: Bootloader ACK confirmed (04 0E)! Bypass mode ON.");
+						ADDLOG_INFO(LOG_FEATURE_DRV, "CB2S: Bootloader ACK confirmed (04 0E)! SUCCESS on attempt #%d (pulse=%d ms, wait=%d ms)! Bypass mode ON.", g_reset_attempt, g_last_pulse_ms, g_last_wait_ms);
 						break;
 					}
 					else
@@ -172,8 +174,10 @@ static void UTCP_RX_Thd(void* param)
 
 							// Dynamic sweeping timing:
 							// post-reset delay sweeps: 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35 ms
-							int post_delay = 2 + (g_reset_attempt % 12) * 3;
-							int reset_pulse = 20 + ((g_reset_attempt / 2) % 3) * 10;
+							g_last_wait_ms = 2 + (g_reset_attempt % 12) * 3;
+							int post_delay = g_last_wait_ms;
+							g_last_pulse_ms = 20 + ((g_reset_attempt / 2) % 3) * 10;
+							int reset_pulse = g_last_pulse_ms;
 
 							ADDLOG_INFO(LOG_FEATURE_DRV, "CB2S: Reset #%d (pulse=%d ms, wait=%d ms)...", g_reset_attempt, reset_pulse, post_delay);
 
