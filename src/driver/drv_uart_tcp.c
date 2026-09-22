@@ -57,11 +57,14 @@ static void UTCP_TX_Thd(void* param)
 		int len = UART_GetDataSize();
 
 		if(client_fd == INVALID_SOCK) goto exit;
-		while(len < buf_size && delay < 10)
+		if(g_bk_synced)
 		{
-			rtos_delay_milliseconds(1);
-			len = UART_GetDataSize();
-			delay++;
+			while(len < buf_size && delay < 10)
+			{
+				rtos_delay_milliseconds(1);
+				len = UART_GetDataSize();
+				delay++;
+			}
 		}
 
 		if(len > 0)
@@ -160,15 +163,26 @@ static void UTCP_RX_Thd(void* param)
 					{
 						g_magic_match = 0;
 						uint32_t now = (uint32_t)rtos_get_time();
-						if((now - g_bk_last_reset) > 2000)
+						if((now - g_bk_last_reset) > 400)
 						{
 							g_bk_last_reset = now;
-							ADDLOG_INFO(LOG_FEATURE_DRV, "CB2S: Magic init detected! Triggering CEN reset...");
+							ADDLOG_INFO(LOG_FEATURE_DRV, "CB2S: Magic init detected! Triggering CEN reset & hardware burst...");
 							HAL_PIN_Setup_Output(BK_CEN_PIN);
 							HAL_PIN_SetOutputValue(BK_CEN_PIN, 0);
-							rtos_delay_milliseconds(25);
+							rtos_delay_milliseconds(20);
 							HAL_PIN_Setup_Input(BK_CEN_PIN);
-							rtos_delay_milliseconds(5);
+							rtos_delay_milliseconds(15);
+
+							// Hardware burst: send link check packets directly into CB2S bootloader window!
+							const uint8_t link_pkt[] = { 0x01, 0xE0, 0xFC, 0x01, 0x00 };
+							for(int burst = 0; burst < 4; burst++)
+							{
+								for(int k = 0; k < (int)sizeof(link_pkt); k++)
+								{
+									UART_SendByte(link_pkt[k]);
+								}
+								rtos_delay_milliseconds(12);
+							}
 						}
 					}
 					else
