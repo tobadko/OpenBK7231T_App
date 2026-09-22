@@ -7,6 +7,7 @@
 #include "errno.h"
 #include <lwip/sockets.h>
 #include "drv_uart.h"
+#include "../hal/hal_pins.h"
 
 #if ENABLE_DRIVER_UART_TCP
 
@@ -40,7 +41,6 @@ static int g_bk_synced = 0;    // 0 = ловим бутлоадер, 1 = чип 
 static uint32_t g_bk_last_reset = 0; // Время последнего сброса (мс)
 static int g_magic_match = 0; // Для скользящего окна преамбулы (0x01, 0xE0, 0xFC)
 static int g_ack_match = 0;   // Для скользящего окна ответа (0x04, 0x0E)
-int rtos_get_time(void);
 
 void Start_UART_TCP(void* arg);
 void UART_TCP_Deinit();
