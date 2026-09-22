@@ -40,7 +40,8 @@ static byte* g_utcpBuf = 0;
 static int g_bk_synced = 0;    // 0 = ловим бутлоадер, 1 = чип пойман (прозрачный режим)
 static uint32_t g_bk_last_reset = 0; // Время последнего сброса (мс)
 static int g_magic_match = 0; // Для скользящего окна преамбулы (0x01, 0xE0, 0xFC)
-static int g_ack_match = 0;   // Для скользящего окна ответа (0x04, 0x0E)
+static int g_ack_match = 0;
+static int g_reset_attempt = 0; // counter for dynamic sweeping CEN timing   // Для скользящего окна ответа (0x04, 0x0E)
 
 void Start_UART_TCP(void* arg);
 void UART_TCP_Deinit();
@@ -113,6 +114,7 @@ static void UTCP_TX_Thd(void* param)
 			{
 				goto exit;
 			}
+			rtos_delay_milliseconds(2);
 			continue;
 		}
 
@@ -163,25 +165,42 @@ static void UTCP_RX_Thd(void* param)
 					{
 						g_magic_match = 0;
 						uint32_t now = (uint32_t)rtos_get_time();
-						if((now - g_bk_last_reset) > 400)
+						if((now - g_bk_last_reset) > 300)
 						{
 							g_bk_last_reset = now;
-							ADDLOG_INFO(LOG_FEATURE_DRV, "CB2S: Magic init detected! Triggering CEN reset & hardware burst...");
+							g_reset_attempt++;
+
+							// Dynamic sweeping timing:
+							// post-reset delay sweeps: 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35 ms
+							int post_delay = 2 + (g_reset_attempt % 12) * 3;
+							int reset_pulse = 20 + ((g_reset_attempt / 2) % 3) * 10;
+
+							ADDLOG_INFO(LOG_FEATURE_DRV, "CB2S: Reset #%d (pulse=%d ms, wait=%d ms)...", g_reset_attempt, reset_pulse, post_delay);
+
+							// 1. Pull CEN low (active reset)
 							HAL_PIN_Setup_Output(BK_CEN_PIN);
 							HAL_PIN_SetOutputValue(BK_CEN_PIN, 0);
-							rtos_delay_milliseconds(20);
-							HAL_PIN_Setup_Input(BK_CEN_PIN);
-							rtos_delay_milliseconds(15);
+							rtos_delay_milliseconds(reset_pulse);
 
-							// Hardware burst: send link check packets directly into CB2S bootloader window!
+							// 2. Drive CEN high actively for 2 ms to sharpen rising edge
+							HAL_PIN_SetOutputValue(BK_CEN_PIN, 1);
+							rtos_delay_milliseconds(2);
+
+							// 3. Release CEN to Hi-Z (input)
+							HAL_PIN_Setup_Input(BK_CEN_PIN);
+
+							// 4. Dynamic post-reset delay before bursts
+							rtos_delay_milliseconds(post_delay);
+
+							// 5. Send high-density bursts (8 bursts spaced by 5 ms)
 							const uint8_t link_pkt[] = { 0x01, 0xE0, 0xFC, 0x01, 0x00 };
-							for(int burst = 0; burst < 4; burst++)
+							for(int burst = 0; burst < 8; burst++)
 							{
 								for(int k = 0; k < (int)sizeof(link_pkt); k++)
 								{
 									UART_SendByte(link_pkt[k]);
 								}
-								rtos_delay_milliseconds(12);
+								rtos_delay_milliseconds(5);
 							}
 						}
 					}
@@ -275,6 +294,7 @@ void UART_TCP_TRX_Thread()
 			// >>> НАШ КОД: Взводим состояние для новой сессии прошивки <<<
 			g_bk_synced = 0;
 			g_bk_last_reset = 0;
+			g_reset_attempt = 0;
 			g_magic_match = 0;
 			g_ack_match = 0;
 			ADDLOG_INFO(LOG_FEATURE_DRV, "CB2S: Client connected, ready to listen stream.");
@@ -323,6 +343,7 @@ void UART_TCP_TRX_Thread()
 					ADDLOG_DEBUG(LOG_FEATURE_DRV, "UART TCP connection closed", err);
 					// >>> НАШ КОД: Сбрасываем флаги при отключении ПК <<<
 					g_bk_synced = 0;
+					g_reset_attempt = 0;
 					g_magic_match = 0;
 					g_ack_match = 0;
 					ADDLOG_INFO(LOG_FEATURE_DRV, "CB2S: Client disconnected, flags reset.");
