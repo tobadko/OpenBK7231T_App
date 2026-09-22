@@ -295,6 +295,7 @@ void UART_TCP_TRX_Thread()
 			g_bk_synced = 0;
 			g_bk_last_reset = 0;
 			g_reset_attempt = 0;
+			g_reset_attempt = 0;
 			g_magic_match = 0;
 			g_ack_match = 0;
 			ADDLOG_INFO(LOG_FEATURE_DRV, "CB2S: Client connected, ready to listen stream.");
