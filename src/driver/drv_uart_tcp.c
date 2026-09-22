@@ -34,6 +34,14 @@ static xTaskHandle g_tx_thread = NULL;
 static bool rx_closed, tx_closed;
 static byte* g_utcpBuf = 0;
 
+// >>> НАШ КОД: Настройки авто-захвата бутлоадера CB2S / BK7231N <<<
+#define BK_CEN_PIN          8   // Номер GPIO программатора, подключенного к CEN (P8)
+static int g_bk_synced = 0;    // 0 = ловим бутлоадер, 1 = чип пойман (прозрачный режим)
+static uint32_t g_bk_last_reset = 0; // Время последнего сброса (мс)
+static int g_magic_match = 0; // Для скользящего окна преамбулы (0x01, 0xE0, 0xFC)
+static int g_ack_match = 0;   // Для скользящего окна ответа (0x04, 0x0E)
+int rtos_get_time(void);
+
 void Start_UART_TCP(void* arg);
 void UART_TCP_Deinit();
 
@@ -63,6 +71,27 @@ static void UTCP_TX_Thd(void* param)
 				g_utcpBuf[i] = UART_GetByte(i);
 			}
 			UART_ConsumeBytes(len);
+
+			// >>> НАШ КОД: Ловим подтверждение (ACK) от бутлоадера CB2S <<<
+			if(!g_bk_synced)
+			{
+				for(int i = 0; i < len; i++)
+				{
+					uint8_t b = g_utcpBuf[i];
+					if(b == 0x04 && g_ack_match == 0) g_ack_match = 1;
+					else if(b == 0x0E && g_ack_match == 1)
+					{
+						g_ack_match = 0;
+						g_bk_synced = 1;
+						ADDLOG_INFO(LOG_FEATURE_DRV, "CB2S: Bootloader ACK confirmed (04 0E)! Bypass mode ON.");
+						break;
+					}
+					else
+					{
+						g_ack_match = (b == 0x04) ? 1 : 0;
+					}
+				}
+			}
 #if UTCP_DEBUG
 			char data[len * 2];
 			char* p = data;
@@ -119,6 +148,36 @@ static void UTCP_RX_Thd(void* param)
 			}
 			ADDLOG_EXTRADEBUG(LOG_FEATURE_DRV, "%d bytes TCP RX->UART TX: %s", ret, data);
 #endif
+			// >>> НАШ КОД: Проверка пакетов инициализации и сброс CEN <<<
+			if(!g_bk_synced)
+			{
+				for(int i = 0; i < ret; i++)
+				{
+					uint8_t b = buffer[i];
+					if(b == 0x01 && g_magic_match == 0) g_magic_match = 1;
+					else if(b == 0xE0 && g_magic_match == 1) g_magic_match = 2;
+					else if(b == 0xFC && g_magic_match == 2)
+					{
+						g_magic_match = 0;
+						uint32_t now = (uint32_t)rtos_get_time();
+						if((now - g_bk_last_reset) > 2000)
+						{
+							g_bk_last_reset = now;
+							ADDLOG_INFO(LOG_FEATURE_DRV, "CB2S: Magic init detected! Triggering CEN reset...");
+							HAL_PIN_Setup_Output(BK_CEN_PIN);
+							HAL_PIN_SetOutputValue(BK_CEN_PIN, 0);
+							rtos_delay_milliseconds(25);
+							HAL_PIN_Setup_Input(BK_CEN_PIN);
+							rtos_delay_milliseconds(5);
+						}
+					}
+					else
+					{
+						g_magic_match = (b == 0x01) ? 1 : 0;
+					}
+				}
+			}
+
 			for(int i = 0; i < ret; i++)
 			{
 				UART_SendByte(buffer[i]);
@@ -199,6 +258,13 @@ void UART_TCP_TRX_Thread()
 		client_sock = accept(listen_sock, (struct sockaddr*)&source_addr, &addr_len);
 		if(client_sock != INVALID_SOCK)
 		{
+			// >>> НАШ КОД: Взводим состояние для новой сессии прошивки <<<
+			g_bk_synced = 0;
+			g_bk_last_reset = 0;
+			g_magic_match = 0;
+			g_ack_match = 0;
+			ADDLOG_INFO(LOG_FEATURE_DRV, "CB2S: Client connected, ready to listen stream.");
+
 			if(g_conn_channel >= 0) CHANNEL_Set(g_conn_channel, 1, CHANNEL_SET_FLAG_SKIP_MQTT | CHANNEL_SET_FLAG_SILENT);
 			rx_closed = true;
 			tx_closed = true;
@@ -241,6 +307,11 @@ void UART_TCP_TRX_Thread()
 				{
 					close(client_sock);
 					ADDLOG_DEBUG(LOG_FEATURE_DRV, "UART TCP connection closed", err);
+					// >>> НАШ КОД: Сбрасываем флаги при отключении ПК <<<
+					g_bk_synced = 0;
+					g_magic_match = 0;
+					g_ack_match = 0;
+					ADDLOG_INFO(LOG_FEATURE_DRV, "CB2S: Client disconnected, flags reset.");
 					if(g_conn_channel >= 0) CHANNEL_Set(g_conn_channel, 0, CHANNEL_SET_FLAG_SKIP_MQTT | CHANNEL_SET_FLAG_SILENT);
 					break;
 				}
@@ -307,6 +378,9 @@ void UART_TCP_Init()
 
 	UART_InitUART(g_baudRate, 0, flowcontrol > 0 ? true : false);
 	UART_InitReceiveRingBuffer(buf_size * 2);
+
+	// >>> НАШ КОД: Сразу при старте драйвера переводим P8 в Hi-Z (вход) <<<
+	HAL_PIN_Setup_Input(BK_CEN_PIN);
 
 	if(g_start_thread != NULL)
 	{
