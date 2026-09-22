@@ -32,18 +32,18 @@ static xTaskHandle g_start_thread = NULL;
 static xTaskHandle g_trx_thread = NULL;
 static xTaskHandle g_rx_thread = NULL;
 static xTaskHandle g_tx_thread = NULL;
-static bool rx_closed, tx_closed;
+static volatile bool rx_closed = true, tx_closed = true;
 static byte* g_utcpBuf = 0;
 
-// >>> РќРђРЁ РљРћР”: РќР°СЃС‚СЂРѕР№РєРё Р°РІС‚Рѕ-Р·Р°С…РІР°С‚Р° Р±СѓС‚Р»РѕР°РґРµСЂР° CB2S / BK7231N <<<
-#define BK_CEN_PIN          8   // РќРѕРјРµСЂ GPIO РїСЂРѕРіСЂР°РјРјР°С‚РѕСЂР°, РїРѕРґРєР»СЋС‡РµРЅРЅРѕРіРѕ Рє CEN (P8)
-static int g_bk_synced = 0;    // 0 = Р»РѕРІРёРј Р±СѓС‚Р»РѕР°РґРµСЂ, 1 = С‡РёРї РїРѕР№РјР°РЅ (РїСЂРѕР·СЂР°С‡РЅС‹Р№ СЂРµР¶РёРј)
-static uint32_t g_bk_last_reset = 0; // Р’СЂРµРјСЏ РїРѕСЃР»РµРґРЅРµРіРѕ СЃР±СЂРѕСЃР° (РјСЃ)
-static int g_magic_match = 0; // Р”Р»СЏ СЃРєРѕР»СЊР·СЏС‰РµРіРѕ РѕРєРЅР° РїСЂРµР°РјР±СѓР»С‹ (0x01, 0xE0, 0xFC)
+// >>> НАШ КОД: Настройки авто-захвата бутлоадера CB2S / BK7231N <<<
+#define BK_CEN_PIN          8   // Номер GPIO программатора, подключенного к CEN (P8)
+static int g_bk_synced = 0;    // 0 = ловим бутлоадер, 1 = чип пойман (прозрачный режим)
+static uint32_t g_bk_last_reset = 0; // Время последнего сброса (мс)
+static int g_magic_match = 0; // Для скользящего окна преамбулы (0x01, 0xE0, 0xFC)
 static int g_ack_match = 0;
 static int g_last_pulse_ms = 0;
 static int g_last_wait_ms = 0;
-static int g_reset_attempt = 0; // counter for dynamic sweeping CEN timing   // Р”Р»СЏ СЃРєРѕР»СЊР·СЏС‰РµРіРѕ РѕРєРЅР° РѕС‚РІРµС‚Р° (0x04, 0x0E)
+static int g_reset_attempt = 0; // counter for dynamic sweeping CEN timing   // Для скользящего окна ответа (0x04, 0x0E)
 
 void Start_UART_TCP(void* arg);
 void UART_TCP_Deinit();
@@ -54,6 +54,7 @@ static void UTCP_TX_Thd(void* param)
 
 	while(1)
 	{
+		if(rx_closed) goto exit;
 		int ret = 0;
 		int delay = 0;
 		memset(g_utcpBuf, 0, buf_size);
@@ -78,7 +79,7 @@ static void UTCP_TX_Thd(void* param)
 			}
 			UART_ConsumeBytes(len);
 
-			// >>> РќРђРЁ РљРћР”: Р›РѕРІРёРј РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ (ACK) РѕС‚ Р±СѓС‚Р»РѕР°РґРµСЂР° CB2S <<<
+			// >>> НАШ КОД: Ловим подтверждение (ACK) от бутлоадера CB2S <<<
 			if(!g_bk_synced)
 			{
 				for(int i = 0; i < len; i++)
@@ -139,6 +140,7 @@ static void UTCP_RX_Thd(void* param)
 
 	while(1)
 	{
+		if(rx_closed) goto exit;
 		int ret = 0;
 
 		if(client_fd == INVALID_SOCK) goto exit;
@@ -155,7 +157,7 @@ static void UTCP_RX_Thd(void* param)
 			}
 			ADDLOG_EXTRADEBUG(LOG_FEATURE_DRV, "%d bytes TCP RX->UART TX: %s", ret, data);
 #endif
-			// >>> РќРђРЁ РљРћР”: РџСЂРѕРІРµСЂРєР° РїР°РєРµС‚РѕРІ РёРЅРёС†РёР°Р»РёР·Р°С†РёРё Рё СЃР±СЂРѕСЃ CEN <<<
+			// >>> НАШ КОД: Проверка пакетов инициализации и сброс CEN <<<
 			if(!g_bk_synced)
 			{
 				for(int i = 0; i < ret; i++)
@@ -186,14 +188,10 @@ static void UTCP_RX_Thd(void* param)
 							HAL_PIN_SetOutputValue(BK_CEN_PIN, 0);
 							rtos_delay_milliseconds(reset_pulse);
 
-							// 2. Drive CEN high actively for 2 ms to sharpen rising edge
+							// 2. Drive CEN high (run mode) - keep active 3.3V!
 							HAL_PIN_SetOutputValue(BK_CEN_PIN, 1);
-							rtos_delay_milliseconds(2);
 
-							// 3. Release CEN to Hi-Z (input)
-							HAL_PIN_Setup_Input(BK_CEN_PIN);
-
-							// 4. Dynamic post-reset delay before bursts
+							// 3. Dynamic post-reset delay before bursts
 							rtos_delay_milliseconds(post_delay);
 
 							// 5. Send high-density bursts (8 bursts spaced by 5 ms)
@@ -295,7 +293,7 @@ void UART_TCP_TRX_Thread()
 		client_sock = accept(listen_sock, (struct sockaddr*)&source_addr, &addr_len);
 		if(client_sock != INVALID_SOCK)
 		{
-			// >>> РќРђРЁ РљРћР”: Р’Р·РІРѕРґРёРј СЃРѕСЃС‚РѕСЏРЅРёРµ РґР»СЏ РЅРѕРІРѕР№ СЃРµСЃСЃРёРё РїСЂРѕС€РёРІРєРё <<<
+			// >>> НАШ КОД: Взводим состояние для новой сессии прошивки <<<
 			g_bk_synced = 0;
 			g_bk_last_reset = 0;
 			g_reset_attempt = 0;
@@ -305,8 +303,8 @@ void UART_TCP_TRX_Thread()
 			ADDLOG_INFO(LOG_FEATURE_DRV, "CB2S: Client connected, ready to listen stream.");
 
 			if(g_conn_channel >= 0) CHANNEL_Set(g_conn_channel, 1, CHANNEL_SET_FLAG_SKIP_MQTT | CHANNEL_SET_FLAG_SILENT);
-			rx_closed = true;
-			tx_closed = true;
+			rx_closed = false;
+			tx_closed = false;
 
 			if(g_tx_thread != NULL)
 			{
@@ -342,11 +340,12 @@ void UART_TCP_TRX_Thread()
 
 			while(1)
 			{
-				if(tx_closed && rx_closed)
+				if(tx_closed || rx_closed)
 				{
 					close(client_sock);
-					ADDLOG_DEBUG(LOG_FEATURE_DRV, "UART TCP connection closed", err);
-					// >>> РќРђРЁ РљРћР”: РЎР±СЂР°СЃС‹РІР°РµРј С„Р»Р°РіРё РїСЂРё РѕС‚РєР»СЋС‡РµРЅРёРё РџРљ <<<
+					client_sock = INVALID_SOCK;
+					ADDLOG_DEBUG(LOG_FEATURE_DRV, "UART TCP connection closed");
+					// >>> НАШ КОД: Сбрасываем флаги при отключении ПК <<<
 					g_bk_synced = 0;
 					g_reset_attempt = 0;
 					g_magic_match = 0;
@@ -419,8 +418,9 @@ void UART_TCP_Init()
 	UART_InitUART(g_baudRate, 0, flowcontrol > 0 ? true : false);
 	UART_InitReceiveRingBuffer(buf_size * 2);
 
-	// >>> РќРђРЁ РљРћР”: РЎСЂР°Р·Сѓ РїСЂРё СЃС‚Р°СЂС‚Рµ РґСЂР°Р№РІРµСЂР° РїРµСЂРµРІРѕРґРёРј P8 РІ Hi-Z (РІС…РѕРґ) <<<
-	HAL_PIN_Setup_Input(BK_CEN_PIN);
+	// >>> НАШ КОД: Сразу при старте драйвера переводим P8 в Hi-Z (вход) <<<
+	HAL_PIN_Setup_Output(BK_CEN_PIN);
+	HAL_PIN_SetOutputValue(BK_CEN_PIN, 1);
 
 	if(g_start_thread != NULL)
 	{
